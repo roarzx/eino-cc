@@ -1,0 +1,12 @@
+repo_root: "."
+model:
+  provider: vision-proxy
+  model: claude-4-sonnet
+  api_key: "your-api-key-here"
+
+agent:
+  max_iterations: 3
+
+commands:
+  test: "go test ./..."
+  lint: "golangci-lint run ./..."
