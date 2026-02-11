@@ -1,0 +1,12 @@
+repo_root: "."
+model:
+  provider: deepseek
+  model: deepseek-chat
+  base_url: "https://api.deepseek.com"
+  api_key_env: DEEPSEEK_KEY
+
+agent:
+  max_iterations: 2
+
+commands:
+  test: "go test ./..."

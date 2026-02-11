@@ -1,28 +1,30 @@
 # Eino 版 Claude Code MVP — 开发方案
 
 > 目标：基于 **Go + Eino** 实现一个可运行的“类 Claude Code” Coding Agent
-> 能在真实代码仓库中：搜索 → 阅读 → 生成 diff → 应用 patch → 运行测试 → 自动修复（循环）
+> 能在真实代码仓库中：搜索 → 阅读 → 生成 diff → 应用 patch → 运行测试 → 输出 diff + 摘要（可选 1 次重试）
 
 # 1. 项目目标与范围
 
-## 1.1 MVP能力（两周内落地）
+## 1.1 MVP能力（两天版，48h 可落地）
 
-本项目实现一个最小可用的 Coding Agent：
+本项目实现一个最小可用的 Coding Agent（单机 CLI 版）：
 
-| 能力                     | 是否在 MVP |
-| ------------------------ | ---------- |
-| Repo 结构读取            | ✅          |
-| 代码搜索（ripgrep）      | ✅          |
-| 文件读取                 | ✅          |
-| 生成 unified diff        | ✅          |
-| git apply 应用 patch     | ✅          |
-| 自动运行测试             | ✅          |
-| 测试失败自动修复（≤3轮） | ✅          |
-| 输出最终 diff + 变更摘要 | ✅          |
-| OTEL 可观测              | ✅          |
+| 能力                     | 是否在两天版 MVP |
+| ------------------------ | ---------------- |
+| Repo 结构读取            | ✅               |
+| 代码搜索（ripgrep）      | ✅               |
+| 文件读取                 | ✅               |
+| 生成 unified diff        | ✅               |
+| 应用 patch（git apply）  | ✅               |
+| 自动运行测试（固定命令） | ✅               |
+| 输出最终 diff + 变更摘要 | ✅               |
 
-**不在 MVP**
+**不在两天版 MVP（V2）**
 
+- OTEL 可观测
+- Planner（生成计划 JSON）
+- Reflect（失败诊断与自修复多轮）
+- 自动修复（>1 次重试）
 - IDE 插件
 - 向量数据库
 - 多 Agent 协作
@@ -30,12 +32,22 @@
 
 ## 1.2 成功标准
 
-Agent 能完成以下场景：
+在一个指定的真实代码仓库中（repo_root 可配置），Agent 通过一次 CLI 指令完成闭环：
 
-- 修复简单 bug
-- 修改函数逻辑
-- 添加小功能
-- 修改后 tests/build 通过
+- 能搜索到与目标相关的代码位置（ripgrep）
+- 能打开并读取目标文件内容
+- 能输出一份可应用的 unified diff
+- 能应用补丁并运行测试命令（默认：go test ./...）
+- 测试通过时输出：最终 git diff + 变更摘要
+
+验收输入示例：
+
+- `eino-code "修改某函数逻辑并保证 go test ./... 通过"`
+
+验收输出要求：
+
+- 展示关键步骤日志（Search/Read/Patch/Apply/Test）
+- 最终给出 git diff 与 3-6 行摘要
 
 # 2. 总体架构
 
@@ -44,20 +56,18 @@ Agent 能完成以下场景：
 ```
 User CLI 输入
       ↓
-Planner（生成计划）
-      ↓
-Agent Loop
+Agent Loop（单阶段）
   ├─ Search Code
   ├─ Read File
   ├─ Generate Patch
   ├─ Apply Patch
   ├─ Run Tests
-  └─ Reflect / Fix
+  └─ Output Diff + Summary
       ↓
 输出最终 Diff + Summary
 ```
 
-## 2.2 状态机（核心）
+## 2.2 状态机（V2）
 
 ```
 stateDiagram-v2
@@ -101,10 +111,6 @@ eino-claude-code-mvp/
 │   │   ├── git.go
 │   │   └── index.go
 │   │
-│   ├── observe/
-│   │   ├── logger.go
-│   │   └── otel.go
-│   │
 │   └── config/
 │       └── config.go
 │
@@ -124,8 +130,6 @@ type RunState struct {
 
     Iteration     int
     MaxIterations int
-
-    PlanJSON      string
 
     RepoNotes     []string
     OpenedFiles   map[string]string
@@ -179,44 +183,18 @@ Agent **只能通过工具操作仓库**。
 
 # 6. Agent 编排设计
 
-## 6.1 双阶段架构
+## 6.1 单阶段架构（两天版 MVP）
 
-### Stage 1 — Planner
+两天版采用单阶段 Agent：模型根据当前目标与工具返回结果，选择下一步工具并生成补丁。
 
-生成 JSON 执行计划：
-
-```
-{
-  "steps": [
-    {"tool":"search_code","args":{"query":"login"}},
-    {"tool":"open_file","args":{"path":"auth/login.go"}},
-    {"tool":"apply_patch"},
-    {"tool":"run_cmd"}
-  ],
-  "success_criteria":["tests pass"]
-}
-```
-
-### Stage 2 — ReAct Loop
-
-最大循环：**3轮**
-
-每轮执行：
-
-1. 选择工具
-2. 生成 patch
-3. 应用 patch
-4. 运行 tests
-5. 判断是否成功
-6. 若失败 → 进入 Reflect
+- 不要求先生成严格 JSON 计划
+- 默认只允许 1 次补丁尝试 + 可选 1 次重试（最多 2 轮）
 
 # 7. Prompt 体系
 
-## 7.1 Planner Prompt
+两天版仅保留最小 Prompt 集合。
 
-生成严格 JSON 计划。
-
-## 7.2 ReAct System Prompt
+## 7.1 System Prompt
 
 约束模型行为：
 
@@ -224,20 +202,12 @@ Agent **只能通过工具操作仓库**。
 - 必须先 search 再 open
 - 修改必须用 unified diff
 - diff 必须最小化
-- 最多3轮修复
+- 最多 2 轮尝试
 
-## 7.3 Patch Prompt
+## 7.2 Patch Prompt
 
 输入：文件片段 + 目标
 输出：`diff --git` 格式
-
-## 7.4 Reflect Prompt
-
-输入：stderr
-输出：
-
-- 失败原因
-- 下一步行动
 
 # 8. Agent Loop 实现（伪代码）
 
@@ -258,7 +228,6 @@ for i := 1; i <= MaxIterations; i++ {
     }
 
     state.Attempts = append(state.Attempts, result)
-    agent.ReflectAndContinue()
 }
 ```
 
@@ -273,37 +242,25 @@ model:
   model: claude-4-sonnet
 
 agent:
-  max_iterations: 3
+  max_iterations: 2
 
 commands:
   test: "go test ./..."
-  lint: "golangci-lint run ./..."
 ```
 
-# 10. 可观测性（OTEL）
-
-必须埋点：
-
-| Span             | 说明     |
-| ---------------- | -------- |
-| agent.plan       | 生成计划 |
-| agent.iteration  | 每轮循环 |
-| tool.search_code | 搜索     |
-| tool.open_file   | 读文件   |
-| tool.apply_patch | 应用补丁 |
-| tool.run_cmd     | 执行测试 |
-
-# 11. CLI 输出设计
+# 10. CLI 输出设计
 
 运行示例：
 
 ```
 $ eino-code "fix login bug"
 
-Plan:
+Steps:
 1. search login handler
-2. modify auth/login.go
-3. run tests
+2. open auth/login.go
+3. generate patch
+4. apply patch
+5. run tests
 
 Iteration 1:
 - Patch applied
@@ -319,29 +276,33 @@ git diff:
 ...
 ```
 
-# 12. 开发排期
+# 11. 开发排期（两天版）
 
-## Week 1
+## Day 1
 
-- CLI + config
+- CLI + config（最小）
 - repo_tree / search_code / open_file
 - apply_patch / run_cmd
-- OTEL 基础
+- git_diff + summary 输出
 
-## Week 2
+## Day 2
 
-- Eino Agent 接入
-- Planner + Reflect
-- 自动修复 loop
-- 最终 diff 输出
+- 接入 Eino Agent（单阶段）
+- Prompt 约束 + patch 生成
+- 最多 2 轮尝试（1 次重试）
+- 端到端验收：在真实仓库跑通一次闭环
 
-# 13. 后续演进（V2）
+# 12. 后续演进（V2）
 
 - gopls / tree-sitter 索引
 - Embedding 检索
 - 多 Agent（Planner / Reviewer / Tester）
 - PR 自动生成
 - Web UI
+- OTEL 可观测
+- Planner（严格 JSON 计划）
+- Reflect（失败诊断与多轮自修复）
+- 状态机驱动的可控编排
 
 # 结语
 
