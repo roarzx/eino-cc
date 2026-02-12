@@ -103,6 +103,9 @@ func (r *Runner) Run(ctx context.Context, goal string) error {
 	allowed := map[string]string{
 		"test": r.Cfg.Commands.Test,
 	}
+	if strings.TrimSpace(r.Cfg.Commands.Fmt) != "" {
+		allowed["fmt"] = r.Cfg.Commands.Fmt
+	}
 	toolset := newRepoToolset(r.RepoRoot, allowed)
 	tools, err := toolset.Tools(ctx)
 	if err != nil {
@@ -202,6 +205,137 @@ func (r *Runner) Run(ctx context.Context, goal string) error {
 	return fmt.Errorf("tests failed after %d attempts: %s", attempts, lastFailure)
 }
 
+func (r *Runner) Propose(ctx context.Context, goal string, lastFailure string, trace func(string)) (string, error) {
+	if strings.TrimSpace(goal) == "" {
+		return "", errors.New("goal is empty")
+	}
+	if r.Cfg == nil {
+		return "", errors.New("config is nil")
+	}
+	if strings.TrimSpace(r.RepoRoot) == "" {
+		return "", errors.New("repo_root is empty")
+	}
+	if out, err := repoTools.RunCommand(ctx, r.RepoRoot, "git", "rev-parse", "--is-inside-work-tree"); err != nil || out.ExitCode != 0 {
+		return "", fmt.Errorf("repo_root is not a git repository: %s", r.RepoRoot)
+	}
+
+	provider := strings.ToLower(strings.TrimSpace(r.Cfg.Model.Provider))
+	if provider == "" {
+		provider = "deepseek"
+	}
+
+	apiKeyEnv := strings.TrimSpace(r.Cfg.Model.APIKeyEnv)
+	if apiKeyEnv == "" {
+		if provider == "deepseek" {
+			apiKeyEnv = "DEEPSEEK_KEY"
+		} else {
+			apiKeyEnv = "OPENAI_API_KEY"
+		}
+	}
+	apiKey := os.Getenv(apiKeyEnv)
+	if apiKey == "" {
+		return "", fmt.Errorf("missing api key env %s", apiKeyEnv)
+	}
+
+	modelName := strings.TrimSpace(r.Cfg.Model.Model)
+	if modelName == "" {
+		if provider == "deepseek" {
+			modelName = "deepseek-chat"
+		} else {
+			modelName = "gpt-4o"
+		}
+	}
+
+	baseURL := strings.TrimSpace(r.Cfg.Model.BaseURL)
+	if baseURL == "" && provider == "deepseek" {
+		baseURL = "https://api.deepseek.com"
+	}
+
+	var chatModel model.ToolCallingChatModel
+	switch provider {
+	case "openai":
+		m, err := openai.NewChatModel(ctx, &openai.ChatModelConfig{
+			APIKey:  apiKey,
+			Model:   modelName,
+			BaseURL: baseURL,
+		})
+		if err != nil {
+			return "", fmt.Errorf("create chat model failed: %w", err)
+		}
+		chatModel = m
+	case "deepseek":
+		m, err := openai.NewChatModel(ctx, &openai.ChatModelConfig{
+			APIKey:  apiKey,
+			Model:   modelName,
+			BaseURL: baseURL,
+		})
+		if err != nil {
+			return "", fmt.Errorf("create chat model failed: %w", err)
+		}
+		chatModel = m
+	default:
+		return "", fmt.Errorf("unsupported model provider: %s", provider)
+	}
+
+	allowed := map[string]string{
+		"test": r.Cfg.Commands.Test,
+	}
+	if strings.TrimSpace(r.Cfg.Commands.Fmt) != "" {
+		allowed["fmt"] = r.Cfg.Commands.Fmt
+	}
+
+	toolset := newRepoToolset(r.RepoRoot, allowed)
+	toolset.SetTrace(trace)
+	tools, err := toolset.ToolsForProposal(ctx)
+	if err != nil {
+		return "", fmt.Errorf("build tools failed: %w", err)
+	}
+
+	agent, err := adk.NewChatModelAgent(ctx, &adk.ChatModelAgentConfig{
+		Name:          "eino_code",
+		Description:   "Coding agent for proposing minimal diffs",
+		Instruction:   InteractivePrompt(r.RepoRoot),
+		Model:         chatModel,
+		ToolsConfig:   adk.ToolsConfig{ToolsNodeConfig: compose.ToolsNodeConfig{Tools: tools}},
+		MaxIterations: 24,
+	})
+	if err != nil {
+		return "", fmt.Errorf("create agent failed: %w", err)
+	}
+
+	runner := adk.NewRunner(ctx, adk.RunnerConfig{Agent: agent})
+	prompt := goal
+	if strings.TrimSpace(lastFailure) != "" {
+		prompt = fmt.Sprintf("%s\n\n上一次失败摘要：\n%s\n\n请在不编造的前提下提出最小修复补丁。", goal, lastFailure)
+	}
+
+	var transcript strings.Builder
+	iter := runner.Query(ctx, prompt)
+	for {
+		event, ok := iter.Next()
+		if !ok {
+			break
+		}
+		msg, _, err := adk.GetMessage(event)
+		if err != nil || msg == nil {
+			continue
+		}
+		if strings.TrimSpace(msg.Content) != "" {
+			transcript.WriteString(msg.Content)
+			transcript.WriteString("\n")
+			fmt.Println(msg.Content)
+		}
+	}
+
+	if patch, ok := autoPatchArithmetic(r.RepoRoot, toolset.lastOpenedPath, toolset.lastOpenedContent, lastFailure); ok {
+		return patch, nil
+	}
+	if patch, ok := extractPatch(transcript.String()); ok {
+		return patch, nil
+	}
+	return "", nil
+}
+
 func autoPatchArithmetic(repoRoot string, path string, content string, lastFailure string) (string, bool) {
 	path = strings.TrimSpace(path)
 	content = strings.TrimSpace(content)
@@ -246,7 +380,8 @@ func autoPatchArithmetic(repoRoot string, path string, content string, lastFailu
 +++ b/%s
 @@ -%d,1 +%d,1 @@
 -%s
-+%s`, path, path, path, path, ln, ln, oldLine, newLine)
++%s
+`, path, path, path, path, ln, ln, oldLine, newLine)
 			return patch, true
 		}
 	}
@@ -256,13 +391,22 @@ func autoPatchArithmetic(repoRoot string, path string, content string, lastFailu
 func parseExpectedGot(text string) (expected int, got int, ok bool) {
 	for _, line := range strings.Split(text, "\n") {
 		line = strings.TrimSpace(line)
-		if !strings.Contains(line, "expected") || !strings.Contains(line, "got") {
+		if !strings.Contains(line, "got") && !strings.Contains(line, "want") {
 			continue
 		}
 		if _, err := fmt.Sscanf(line, "expected %d, got %d", &expected, &got); err == nil {
 			return expected, got, true
 		}
+		if _, err := fmt.Sscanf(line, "expected: %d, got: %d", &expected, &got); err == nil {
+			return expected, got, true
+		}
 		if _, err := fmt.Sscanf(line, "expected %d got %d", &expected, &got); err == nil {
+			return expected, got, true
+		}
+		if _, err := fmt.Sscanf(line, "want %d, got %d", &expected, &got); err == nil {
+			return expected, got, true
+		}
+		if _, err := fmt.Sscanf(line, "want %d got %d", &expected, &got); err == nil {
 			return expected, got, true
 		}
 	}
@@ -312,14 +456,24 @@ func extractPatch(text string) (string, bool) {
 	var b strings.Builder
 	for i := start; i < len(lines); i++ {
 		line := lines[i]
-		if i > start && !isDiffLine(line) {
+		if i > start && line != "" && !isDiffLine(line) {
 			break
+		}
+		if line == "" {
+			b.WriteString("\n")
+			continue
 		}
 		b.WriteString(line)
 		b.WriteString("\n")
 	}
 	patch := strings.TrimSpace(b.String())
 	if patch == "" {
+		return "", false
+	}
+	if strings.Contains(patch, "```") {
+		return "", false
+	}
+	if !strings.Contains(patch, "\n@@") {
 		return "", false
 	}
 	return patch, true
@@ -388,6 +542,47 @@ func formatTestFailure(res repoTools.Result) string {
 			return res.JSON()
 		}
 	}
-	out := fmt.Sprintf("exit_code=%d\nstdout:\n%s\nstderr:\n%s", data.ExitCode, data.Stdout, data.Stderr)
+	body := compactTestOutput(data.Stdout, data.Stderr, 40)
+	out := fmt.Sprintf("exit_code=%d\n%s", data.ExitCode, body)
 	return strings.TrimSpace(out)
+}
+
+func compactTestOutput(stdout string, stderr string, maxLines int) string {
+	all := strings.TrimSpace(strings.Join([]string{strings.TrimSpace(stdout), strings.TrimSpace(stderr)}, "\n"))
+	if all == "" {
+		return "stdout/stderr empty"
+	}
+	lines := strings.Split(all, "\n")
+	selected := make([]string, 0, maxLines)
+	keywords := []string{
+		"--- FAIL:",
+		"FAIL\t",
+		"panic:",
+		"expected",
+		"got",
+		"want",
+		".go:",
+	}
+	for _, line := range lines {
+		l := strings.TrimSpace(line)
+		if l == "" {
+			continue
+		}
+		for _, kw := range keywords {
+			if strings.Contains(l, kw) {
+				selected = append(selected, l)
+				break
+			}
+		}
+		if len(selected) >= maxLines {
+			break
+		}
+	}
+	if len(selected) == 0 {
+		if len(lines) > maxLines {
+			lines = lines[:maxLines]
+		}
+		return strings.Join(lines, "\n")
+	}
+	return strings.Join(selected, "\n")
 }

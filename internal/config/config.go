@@ -10,9 +10,9 @@ import (
 )
 
 type Config struct {
-	RepoRoot string `yaml:"repo_root"`
-	Model    Model  `yaml:"model"`
-	Agent    Agent  `yaml:"agent"`
+	RepoRoot string   `yaml:"repo_root"`
+	Model    Model    `yaml:"model"`
+	Agent    Agent    `yaml:"agent"`
 	Commands Commands `yaml:"commands"`
 }
 
@@ -29,6 +29,7 @@ type Agent struct {
 
 type Commands struct {
 	Test string `yaml:"test"`
+	Fmt  string `yaml:"fmt"`
 }
 
 func Load(path string) (*Config, error) {
@@ -65,4 +66,3 @@ func (c *Config) AbsRepoRoot() (string, error) {
 	}
 	return abs, nil
 }
-

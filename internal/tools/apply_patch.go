@@ -16,6 +16,7 @@ type ApplyPatchParams struct {
 }
 
 type ApplyPatchData struct {
+	Phase    string `json:"phase"`
 	ExitCode int    `json:"exit_code"`
 	Stdout   string `json:"stdout"`
 	Stderr   string `json:"stderr"`
@@ -32,6 +33,40 @@ func ApplyPatch(ctx context.Context, repoRoot string, params *ApplyPatchParams) 
 	}
 	if !strings.Contains(patch, "diff --git ") {
 		return Err("patch must include diff --git")
+	}
+
+	checkCmd := exec.CommandContext(ctx, "git", "apply", "--check", "--whitespace=nowarn")
+	checkCmd.Dir = repoRoot
+	checkCmd.Stdin = strings.NewReader(patch)
+
+	var checkStdout bytes.Buffer
+	var checkStderr bytes.Buffer
+	checkCmd.Stdout = &checkStdout
+	checkCmd.Stderr = &checkStderr
+
+	checkErr := checkCmd.Run()
+	checkExitCode := 0
+	if checkErr != nil {
+		if ee, ok := checkErr.(*exec.ExitError); ok {
+			checkExitCode = ee.ExitCode()
+		} else {
+			return Err(fmt.Sprintf("git apply check failed: %v", checkErr))
+		}
+	}
+	if checkExitCode != 0 {
+		if applied, err := applySimplePatch(patch, repoRoot); applied && err == nil {
+			return OK(ApplyPatchData{Phase: "fallback", ExitCode: 0, Stdout: "fallback applied", Stderr: ""})
+		}
+		return Result{
+			OK:    false,
+			Error: "git apply check failed",
+			Data: ApplyPatchData{
+				Phase:    "check",
+				ExitCode: checkExitCode,
+				Stdout:   checkStdout.String(),
+				Stderr:   checkStderr.String(),
+			},
+		}
 	}
 
 	cmd := exec.CommandContext(ctx, "git", "apply", "--whitespace=nowarn")
@@ -53,10 +88,10 @@ func ApplyPatch(ctx context.Context, repoRoot string, params *ApplyPatchParams) 
 		}
 	}
 
-	data := ApplyPatchData{ExitCode: exitCode, Stdout: stdout.String(), Stderr: stderr.String()}
+	data := ApplyPatchData{Phase: "apply", ExitCode: exitCode, Stdout: stdout.String(), Stderr: stderr.String()}
 	if exitCode != 0 {
 		if applied, err := applySimplePatch(patch, repoRoot); applied && err == nil {
-			return OK(ApplyPatchData{ExitCode: 0, Stdout: "fallback applied", Stderr: ""})
+			return OK(ApplyPatchData{Phase: "fallback", ExitCode: 0, Stdout: "fallback applied", Stderr: ""})
 		}
 		return Result{OK: false, Error: "git apply failed", Data: data}
 	}
@@ -117,32 +152,40 @@ func filterPatchByRepo(patch string, repoRoot string) string {
 			i++
 		}
 		block := strings.Join(lines[start:i], "\n")
-		if diffTouchesRepo(block, repoRoot) {
-			blocks = append(blocks, block)
+		if rewritten, ok := rewriteBlockPaths(block, repoRoot); ok {
+			blocks = append(blocks, rewritten)
 		}
 	}
 	return strings.TrimSpace(strings.Join(blocks, "\n"))
 }
 
-func diffTouchesRepo(block string, repoRoot string) bool {
+func rewriteBlockPaths(block string, repoRoot string) (string, bool) {
 	lines := strings.Split(block, "\n")
 	if len(lines) == 0 {
-		return false
+		return "", false
 	}
 	fields := strings.Fields(lines[0])
 	if len(fields) < 4 {
-		return true
+		return block, true
 	}
 	base := filepath.Base(repoRoot)
 	aPath := normalizeRepoPath(strings.TrimPrefix(fields[2], "a/"), base)
 	bPath := normalizeRepoPath(strings.TrimPrefix(fields[3], "b/"), base)
 	if aPath == "dev/null" || bPath == "dev/null" {
-		return true
+		return block, true
 	}
-	if fileExists(filepath.Join(repoRoot, aPath)) || fileExists(filepath.Join(repoRoot, bPath)) {
-		return true
+	aResolved := resolveRepoPath(repoRoot, aPath)
+	bResolved := resolveRepoPath(repoRoot, bPath)
+	if aResolved == "" && bResolved == "" {
+		return "", false
 	}
-	return false
+	if aResolved == "" {
+		aResolved = aPath
+	}
+	if bResolved == "" {
+		bResolved = bPath
+	}
+	return replaceBlockPaths(lines, aResolved, bResolved), true
 }
 
 func normalizeRepoPath(path string, base string) string {
@@ -164,6 +207,42 @@ func fileExists(path string) bool {
 	return err == nil
 }
 
+func resolveRepoPath(repoRoot string, path string) string {
+	path = filepath.ToSlash(filepath.Clean(path))
+	if path == "." || path == "" {
+		return ""
+	}
+	if fileExists(filepath.Join(repoRoot, path)) {
+		return path
+	}
+	parts := strings.Split(path, "/")
+	for i := 1; i < len(parts); i++ {
+		candidate := strings.Join(parts[i:], "/")
+		if fileExists(filepath.Join(repoRoot, candidate)) {
+			return candidate
+		}
+	}
+	return ""
+}
+
+func replaceBlockPaths(lines []string, aPath string, bPath string) string {
+	for i, line := range lines {
+		if strings.HasPrefix(line, "diff --git ") {
+			lines[i] = fmt.Sprintf("diff --git a/%s b/%s", aPath, bPath)
+			continue
+		}
+		if strings.HasPrefix(line, "--- ") {
+			lines[i] = fmt.Sprintf("--- a/%s", aPath)
+			continue
+		}
+		if strings.HasPrefix(line, "+++ ") {
+			lines[i] = fmt.Sprintf("+++ b/%s", bPath)
+			continue
+		}
+	}
+	return strings.Join(lines, "\n")
+}
+
 func applySimplePatch(patch string, repoRoot string) (bool, error) {
 	lines := strings.Split(patch, "\n")
 	var aPath, bPath string
@@ -183,6 +262,12 @@ func applySimplePatch(patch string, repoRoot string) (bool, error) {
 	base := filepath.Base(repoRoot)
 	aPath = normalizeRepoPath(aPath, base)
 	bPath = normalizeRepoPath(bPath, base)
+	if resolved := resolveRepoPath(repoRoot, aPath); resolved != "" {
+		aPath = resolved
+	}
+	if resolved := resolveRepoPath(repoRoot, bPath); resolved != "" {
+		bPath = resolved
+	}
 	target := bPath
 	if target == "" || target == "dev/null" {
 		target = aPath

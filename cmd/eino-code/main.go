@@ -22,13 +22,10 @@ func main() {
 	apiKeyEnv := flag.String("api-key-env", "", "")
 	maxIterations := flag.Int("max-iterations", 0, "")
 	testCmd := flag.String("test-cmd", "", "")
+	fmtCmd := flag.String("fmt-cmd", "", "")
 	flag.Parse()
 
 	goal := strings.TrimSpace(strings.Join(flag.Args(), " "))
-	if goal == "" {
-		fmt.Fprintln(os.Stderr, "missing goal")
-		os.Exit(2)
-	}
 
 	cfg, err := config.Load(*configPath)
 	if err != nil {
@@ -57,17 +54,21 @@ func main() {
 	if *testCmd != "" {
 		cfg.Commands.Test = *testCmd
 	}
-
-	absRepoRoot, err := cfg.AbsRepoRoot()
-	if err != nil {
-		fmt.Fprintln(os.Stderr, err.Error())
-		os.Exit(1)
+	if *fmtCmd != "" {
+		cfg.Commands.Fmt = *fmtCmd
 	}
 
-	r := agent.NewRunner(cfg, absRepoRoot)
-	if err := r.Run(ctx, goal); err != nil {
+	repoRootValue := ""
+	if *repoRoot != "" || cfg.RepoRoot != "" && cfg.RepoRoot != "." {
+		absRepoRoot, err := cfg.AbsRepoRoot()
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err.Error())
+			os.Exit(1)
+		}
+		repoRootValue = absRepoRoot
+	}
+	if err := agent.RunInteractive(ctx, cfg, repoRootValue, goal); err != nil {
 		fmt.Fprintln(os.Stderr, err.Error())
 		os.Exit(1)
 	}
 }
-
