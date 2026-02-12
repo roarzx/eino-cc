@@ -67,7 +67,7 @@ func main() {
 		}
 		repoRootValue = absRepoRoot
 	}
-	if err := agent.RunInteractive(ctx, cfg, repoRootValue, goal); err != nil {
+	if err := agent.RunTUI(ctx, cfg, repoRootValue, goal); err != nil {
 		fmt.Fprintln(os.Stderr, err.Error())
 		os.Exit(1)
 	}

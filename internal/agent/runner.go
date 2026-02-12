@@ -205,7 +205,7 @@ func (r *Runner) Run(ctx context.Context, goal string) error {
 	return fmt.Errorf("tests failed after %d attempts: %s", attempts, lastFailure)
 }
 
-func (r *Runner) Propose(ctx context.Context, goal string, lastFailure string, trace func(string)) (string, error) {
+func (r *Runner) Propose(ctx context.Context, goal string, lastFailure string, emit func(string)) (string, error) {
 	if strings.TrimSpace(goal) == "" {
 		return "", errors.New("goal is empty")
 	}
@@ -285,7 +285,7 @@ func (r *Runner) Propose(ctx context.Context, goal string, lastFailure string, t
 	}
 
 	toolset := newRepoToolset(r.RepoRoot, allowed)
-	toolset.SetTrace(trace)
+	toolset.SetTrace(emit)
 	tools, err := toolset.ToolsForProposal(ctx)
 	if err != nil {
 		return "", fmt.Errorf("build tools failed: %w", err)
@@ -323,7 +323,9 @@ func (r *Runner) Propose(ctx context.Context, goal string, lastFailure string, t
 		if strings.TrimSpace(msg.Content) != "" {
 			transcript.WriteString(msg.Content)
 			transcript.WriteString("\n")
-			fmt.Println(msg.Content)
+			if emit != nil {
+				emit(msg.Content)
+			}
 		}
 	}
 
