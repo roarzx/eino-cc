@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"strings"
 
 	repoTools "eino-cc/internal/tools"
 
@@ -10,12 +11,30 @@ import (
 )
 
 type repoToolset struct {
-	repoRoot string
-	allowed  map[string]string
+	repoRoot          string
+	allowed           map[string]string
+	applied           bool
+	requirePatch      bool
+	openedNonTestFile bool
+	lastOpenedPath    string
+	lastOpenedContent string
 }
 
 func newRepoToolset(repoRoot string, allowed map[string]string) *repoToolset {
 	return &repoToolset{repoRoot: repoRoot, allowed: allowed}
+}
+
+func (t *repoToolset) ResetProgress(keepOpen bool) {
+	t.applied = false
+	if !keepOpen {
+		t.openedNonTestFile = false
+		t.lastOpenedPath = ""
+		t.lastOpenedContent = ""
+	}
+}
+
+func (t *repoToolset) RequirePatch(require bool) {
+	t.requirePatch = require
 }
 
 type repoTreeArgs struct {
@@ -43,6 +62,9 @@ type runCmdArgs struct {
 
 func (t *repoToolset) Tools(ctx context.Context) ([]tool.BaseTool, error) {
 	repoTreeTool, err := toolutils.InferTool("repo_tree", "List files in the git repository", func(ctx context.Context, args *repoTreeArgs) (string, error) {
+		if t.openedNonTestFile && !t.applied {
+			return repoTools.Err("apply_patch required after open_file").JSON(), nil
+		}
 		res := repoTools.RepoTree(ctx, t.repoRoot, &repoTools.RepoTreeParams{MaxEntries: args.MaxEntries})
 		return res.JSON(), nil
 	})
@@ -51,6 +73,9 @@ func (t *repoToolset) Tools(ctx context.Context) ([]tool.BaseTool, error) {
 	}
 
 	searchTool, err := toolutils.InferTool("search_code", "Search code using ripgrep", func(ctx context.Context, args *searchCodeArgs) (string, error) {
+		if t.openedNonTestFile && !t.applied {
+			return repoTools.Err("apply_patch required after open_file").JSON(), nil
+		}
 		res := repoTools.SearchCode(ctx, t.repoRoot, &repoTools.SearchCodeParams{Query: args.Query, MaxResults: args.MaxResults})
 		return res.JSON(), nil
 	})
@@ -60,6 +85,16 @@ func (t *repoToolset) Tools(ctx context.Context) ([]tool.BaseTool, error) {
 
 	openFileTool, err := toolutils.InferTool("open_file", "Open and read a file", func(ctx context.Context, args *openFileArgs) (string, error) {
 		res := repoTools.OpenFile(ctx, t.repoRoot, &repoTools.OpenFileParams{Path: args.Path, Offset: args.Offset, Limit: args.Limit})
+		if args != nil && args.Path != "" && !strings.HasSuffix(args.Path, "_test.go") {
+			t.openedNonTestFile = true
+		}
+		if data, ok := res.Data.(repoTools.OpenFileData); ok {
+			t.lastOpenedPath = data.Path
+			t.lastOpenedContent = stripLineNumbers(data.Content)
+		} else if dataPtr, okPtr := res.Data.(*repoTools.OpenFileData); okPtr && dataPtr != nil {
+			t.lastOpenedPath = dataPtr.Path
+			t.lastOpenedContent = stripLineNumbers(dataPtr.Content)
+		}
 		return res.JSON(), nil
 	})
 	if err != nil {
@@ -68,6 +103,9 @@ func (t *repoToolset) Tools(ctx context.Context) ([]tool.BaseTool, error) {
 
 	applyPatchTool, err := toolutils.InferTool("apply_patch", "Apply a unified diff patch with git apply", func(ctx context.Context, args *applyPatchArgs) (string, error) {
 		res := repoTools.ApplyPatch(ctx, t.repoRoot, &repoTools.ApplyPatchParams{Patch: args.Patch})
+		if res.OK {
+			t.applied = true
+		}
 		return res.JSON(), nil
 	})
 	if err != nil {
@@ -75,6 +113,9 @@ func (t *repoToolset) Tools(ctx context.Context) ([]tool.BaseTool, error) {
 	}
 
 	runCmdTool, err := toolutils.InferTool("run_cmd", "Run an allowed command by name", func(ctx context.Context, args *runCmdArgs) (string, error) {
+		if args != nil && args.Name == "test" && t.requirePatch && !t.applied {
+			return repoTools.Err("apply_patch required before running test").JSON(), nil
+		}
 		res := repoTools.RunCmd(ctx, t.repoRoot, t.allowed, &repoTools.RunCmdParams{Name: args.Name})
 		return res.JSON(), nil
 	})
@@ -93,3 +134,12 @@ func (t *repoToolset) Tools(ctx context.Context) ([]tool.BaseTool, error) {
 	return []tool.BaseTool{repoTreeTool, searchTool, openFileTool, applyPatchTool, runCmdTool, gitDiffTool}, nil
 }
 
+func stripLineNumbers(content string) string {
+	lines := strings.Split(content, "\n")
+	for i, line := range lines {
+		if idx := strings.Index(line, "→"); idx >= 0 {
+			lines[i] = line[idx+len("→"):]
+		}
+	}
+	return strings.Join(lines, "\n")
+}

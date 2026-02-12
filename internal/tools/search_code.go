@@ -34,7 +34,14 @@ func SearchCode(ctx context.Context, repoRoot string, params *SearchCodeParams) 
 
 	out, err := RunCommand(ctx, repoRoot, "rg", "--line-number", "--column", "--no-heading", "--smart-case", params.Query, ".")
 	if err != nil {
-		return Err("rg execution failed")
+		return Err(err.Error())
+	}
+	if out.ExitCode == 2 {
+		msg := strings.TrimSpace(out.Stderr)
+		if msg == "" {
+			msg = "rg execution failed"
+		}
+		return Err(msg)
 	}
 	if out.ExitCode != 0 && strings.TrimSpace(out.Stdout) == "" {
 		return OK(SearchCodeData{Query: params.Query, Matches: nil})
@@ -73,4 +80,3 @@ func parseRGLine(line string) (path string, ln int, col int, text string, ok boo
 	}
 	return parts[0], lnI, colI, parts[3], true
 }
-

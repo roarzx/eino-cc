@@ -106,4 +106,3 @@ func safeJoin(root string, rel string) (string, error) {
 	}
 	return abs, nil
 }
-
